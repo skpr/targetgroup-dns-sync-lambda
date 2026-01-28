@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"os"
-	"slices"
+	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -19,8 +21,15 @@ import (
 type Config struct {
 	StreamName     string `env:"STREAM_NAME,required"`
 	TargetGroupARN string `env:"TARGET_GROUP_ARN,required"`
-	LooupHost      string `env:"LOOKUP_HOST,required"`
+	LooupHost      string `env:"LOOKUP_HOST,required"` // keeping your original field name
 }
+
+const (
+	targetPort           int32 = 443
+	dnsLookupTimeout           = 2 * time.Second
+	dnsLookupAttempts          = 3
+	dnsLookupBackoffBase       = 75 * time.Millisecond
+)
 
 func main() {
 	lambda.Start(handler)
@@ -28,7 +37,6 @@ func main() {
 
 func handler(ctx context.Context) error {
 	var config Config
-
 	if err := env.Load(&config, nil); err != nil {
 		return err
 	}
@@ -38,29 +46,15 @@ func handler(ctx context.Context) error {
 
 	logger.SetAttrs("target_group", config.TargetGroupARN, "lookup_host", config.LooupHost)
 
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, config.LooupHost)
+	registerIPs, err := lookupIPv4StringsWithRetry(ctx, config.LooupHost)
 	if err != nil {
 		return logger.WrapError(err)
 	}
-
-	var (
-		v4s []string
-		v6s []string
-	)
-
-	for _, a := range ips {
-		if a.IP.To4() != nil {
-			v4s = append(v4s, a.IP.String())
-		} else if a.IP.To16() != nil {
-			v6s = append(v6s, a.IP.String())
-		}
+	if len(registerIPs) == 0 {
+		return logger.WrapError(fmt.Errorf("no A records (IPv4) for %s", config.LooupHost))
 	}
 
-	// Logging both for debugging purposes.
-	logger.SetAttrs("lookup_found_ips_v4", v4s, "lookup_found_ips_v6", v6s)
-
-	// We only support IPv4 for target groups
-	registerIPs := v4s
+	logger.SetAttrs("lookup_found_ips", registerIPs)
 
 	awsConfig, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
@@ -76,48 +70,25 @@ func handler(ctx context.Context) error {
 		return logger.WrapError(err)
 	}
 
-	var deregisterTargets []types.TargetDescription
+	targetsToRegister, targetsToDeregister := diffTargets(registerIPs, targetHealth.TargetHealthDescriptions, targetPort)
 
-	for _, th := range targetHealth.TargetHealthDescriptions {
-		if th.Target.Id == nil {
-			continue
-		}
+	logger.SetAttrs("register_targets", targetDescriptionToSlice(targetsToRegister))
+	logger.SetAttrs("deregister_targets", targetDescriptionToSlice(targetsToDeregister))
 
-		// Already added to target group. Don't need to register again.
-		registerIPs = slices.DeleteFunc(registerIPs, func(id string) bool {
-			return id == *th.Target.Id
-		})
-
-		if !slices.Contains(registerIPs, *th.Target.Id) {
-			deregisterTargets = append(deregisterTargets, *th.Target)
-		}
-	}
-
-	logger.SetAttrs("register_targets", registerIPs)
-	logger.SetAttrs("deregister_targets", targetDescriptionToSlice(deregisterTargets))
-
-	if len(deregisterTargets) > 0 {
+	if len(targetsToDeregister) > 0 {
 		_, err := elb.DeregisterTargets(ctx, &elasticloadbalancingv2.DeregisterTargetsInput{
 			TargetGroupArn: aws.String(config.TargetGroupARN),
-			Targets:        deregisterTargets,
+			Targets:        targetsToDeregister,
 		})
 		if err != nil {
 			return logger.WrapError(err)
 		}
 	}
 
-	if len(registerIPs) > 0 {
-		var targets []types.TargetDescription
-		for _, ip := range registerIPs {
-			targets = append(targets, types.TargetDescription{
-				Id:   aws.String(ip),
-				Port: aws.Int32(443),
-			})
-		}
-
+	if len(targetsToRegister) > 0 {
 		_, err := elb.RegisterTargets(ctx, &elasticloadbalancingv2.RegisterTargetsInput{
 			TargetGroupArn: aws.String(config.TargetGroupARN),
-			Targets:        targets,
+			Targets:        targetsToRegister,
 		})
 		if err != nil {
 			return logger.WrapError(err)
@@ -127,9 +98,89 @@ func handler(ctx context.Context) error {
 	return nil
 }
 
+// lookupIPv4StringsWithRetry resolves A records (IPv4) with a short timeout and limited retries.
+func lookupIPv4StringsWithRetry(parent context.Context, host string) ([]string, error) {
+	var lastErr error
+
+	for attempt := 0; attempt < dnsLookupAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(parent, dnsLookupTimeout)
+		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", host)
+		cancel()
+
+		if err == nil {
+			out := make([]string, 0, len(ips))
+
+			for _, ip := range ips {
+				out = append(out, ip.String())
+			}
+
+			return out, nil
+		}
+
+		lastErr = err
+
+		// Retry only on temp/timeout DNS errors.
+		var dnsErr *net.DNSError
+
+		if errors.As(err, &dnsErr) && (dnsErr.IsTemporary || dnsErr.IsTimeout) {
+			time.Sleep(dnsLookupBackoffBase * time.Duration(1<<attempt))
+			continue
+		}
+
+		return nil, err
+	}
+
+	return nil, lastErr
+}
+
+// diffTargets computes:
+//   - toRegister = desired(lookup) - current(existing)
+//   - toDeregister = current(existing) - desired(lookup)
+func diffTargets(lookup []string, existing []types.TargetHealthDescription, port int32) (toRegister, toDeregister []types.TargetDescription) {
+	desired := make(map[string]struct{}, len(lookup))
+
+	for _, ip := range lookup {
+		desired[ip] = struct{}{}
+	}
+
+	for _, th := range existing {
+		if th.Target == nil || th.Target.Id == nil {
+			continue
+		}
+
+		id := *th.Target.Id
+
+		if _, ok := desired[id]; ok {
+			// Already registered and still desired.
+			delete(desired, id)
+			continue
+		}
+
+		// Registered but no longer desired.
+		toDeregister = append(toDeregister, types.TargetDescription{
+			Id:   th.Target.Id,
+			Port: th.Target.Port,
+		})
+	}
+
+	// Remaining desired are missing -> register them.
+	toRegister = make([]types.TargetDescription, 0, len(desired))
+
+	for ip := range desired {
+		ip := ip
+
+		toRegister = append(toRegister, types.TargetDescription{
+			Id:   aws.String(ip),
+			Port: aws.Int32(port),
+		})
+	}
+
+	return toRegister, toDeregister
+}
+
 // Returns a slice of target IDs from a slice of TargetDescription
 func targetDescriptionToSlice(targets []types.TargetDescription) []string {
-	var result []string
+	result := make([]string, 0, len(targets))
 
 	for _, t := range targets {
 		if t.Id != nil {
