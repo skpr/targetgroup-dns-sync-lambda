@@ -1,0 +1,36 @@
+[tools]
+go = "1.25"
+"go:github.com/daixiang0/gci" = "latest"
+"ubi:golangci/golangci-lint" = "2.5"
+
+[env]
+CGO_ENABLED=0
+GOARCH="amd64"
+GOOS="linux"
+
+[tasks.vendor]
+description = "Vendor resets the main module's vendor directory to include all packages needed to build the application"
+run = "go mod vendor"
+
+[tasks.tidy]
+description = "Tidy makes sure go.mod matches the source code in the module"
+run = "go mod tidy"
+
+# https://docs.aws.amazon.com/lambda/latest/dg/golang-package.html
+[tasks.build]
+description = "Build the AWS Lambda binary"
+run = '''
+go build -tags lambda.norpc -o bootstrap main.go
+zip lambda-handler.zip bootstrap
+rm -f bootstrap
+'''
+depends = ["vendor"]
+
+[tasks."lint"]
+description = "Linting automatically checks code for errors and style issues"
+run = "golangci-lint run"
+
+[tasks.test]
+description = "Checks to verify code correctness"
+run = "go test -cover ./..."
+depends = ["vendor"]
