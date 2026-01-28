@@ -38,20 +38,29 @@ func handler(ctx context.Context) error {
 
 	logger.SetAttrs("target_group", config.TargetGroupARN, "lookup_host", config.LooupHost)
 
-	lookup, err := net.LookupIP(config.LooupHost)
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, config.LooupHost)
 	if err != nil {
 		return logger.WrapError(err)
 	}
 
-	var registerIPs []string
+	var (
+		v4s []string
+		v6s []string
+	)
 
-	for _, ip := range lookup {
-		if ipv4 := ip.To4(); ipv4 != nil {
-			registerIPs = append(registerIPs, ipv4.String())
+	for _, a := range ips {
+		if a.IP.To4() != nil {
+			v4s = append(v4s, a.IP.String())
+		} else if a.IP.To16() != nil {
+			v6s = append(v6s, a.IP.String())
 		}
 	}
 
-	logger.SetAttrs("lookup_found_ips", registerIPs)
+	// Logging both for debugging purposes.
+	logger.SetAttrs("lookup_found_ips_v4", v4s, "lookup_found_ips_v6", v6s)
+
+	// We only support IPv4 for target groups
+	registerIPs := v4s
 
 	awsConfig, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
